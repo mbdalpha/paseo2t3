@@ -120,9 +120,8 @@ pub fn scan_paseo(home: &Path, scan: &mut Scan) -> Result<()> {
             continue;
         }
         // persistence.provider names the native tool even for custom provider ids.
-        let provider = str_field(&agent, &["persistence", "provider"])
-            .or_else(|| str_field(&agent, &["provider"]))
-            .unwrap_or("?");
+        let provider =
+            str_field(&agent, &["persistence", "provider"]).or_else(|| str_field(&agent, &["provider"])).unwrap_or("?");
         let Some(driver) = driver_for_paseo_provider(provider) else {
             scan.skip(origin, format!("provider `{provider}` has no T3 equivalent this tool supports"));
             continue;
@@ -139,9 +138,7 @@ pub fn scan_paseo(home: &Path, scan: &mut Scan) -> Result<()> {
         };
 
         let workspace = str_field(&agent, &["workspaceId"]).and_then(|id| workspaces.get(id));
-        let project = workspace
-            .and_then(|w| str_field(w, &["projectId"]))
-            .and_then(|id| projects.get(id));
+        let project = workspace.and_then(|w| str_field(w, &["projectId"])).and_then(|id| projects.get(id));
         let is_worktree = workspace.and_then(|w| str_field(w, &["kind"])) == Some("worktree");
 
         scan.sessions.push(Session {
@@ -426,4 +423,232 @@ fn linked_worktree(dot_git: &Path) -> Option<(String, Option<String>)> {
         .ok()
         .and_then(|h| h.trim().strip_prefix("ref: refs/heads/").map(str::to_string));
     Some((main, branch))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn temp_dir() -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("paseo2t3-test-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write(path: &Path, text: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    fn jsonl(records: &[Value]) -> String {
+        records.iter().map(|r| r.to_string() + "\n").collect()
+    }
+
+    fn merged(base: &Value, extra: Value) -> Value {
+        let mut v = base.clone();
+        v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        v
+    }
+
+    fn session(driver: &str, cwd: &Path) -> Session {
+        Session {
+            driver: driver.into(),
+            native_id: "id".into(),
+            cwd: cwd.display().to_string(),
+            title: None,
+            model: None,
+            updated_at: None,
+            archived: false,
+            branch: None,
+            worktree_path: None,
+            project_root: None,
+            origin: String::new(),
+        }
+    }
+
+    #[test]
+    fn maps_paseo_providers_to_t3_drivers() {
+        assert_eq!(driver_for_paseo_provider("claude"), Some("claudeAgent"));
+        assert_eq!(driver_for_paseo_provider("codex"), Some("codex"));
+        assert_eq!(driver_for_paseo_provider("opencode"), Some("opencode"));
+        assert_eq!(driver_for_paseo_provider("copilot"), None);
+    }
+
+    #[test]
+    fn paseo_reads_nested_and_legacy_agents_and_joins_workspaces() {
+        let home = temp_dir();
+        write(
+            &home.join("projects/projects.json"),
+            &json!([{ "projectId": "prj_1", "rootPath": "/repo" }]).to_string(),
+        );
+        let workspaces = json!([{
+            "workspaceId": "wks_wt", "projectId": "prj_1", "cwd": "/repo-wt", "kind": "worktree",
+            "branch": "feat", "mainRepoRoot": "/repo",
+        }]);
+        write(&home.join("projects/workspaces.json"), &workspaces.to_string());
+        let agent = json!({
+            "id": "agt_1", "provider": "my-claude", "cwd": "/repo-wt", "workspaceId": "wks_wt", "title": "T",
+            "config": { "model": "m" }, "updatedAt": "2026-01-01T00:00:00Z", "archivedAt": "2026-01-02T00:00:00Z",
+            "persistence": { "provider": "claude", "sessionId": "s1" },
+        });
+        write(&home.join("agents/repo-wt/agt_1.json"), &agent.to_string());
+        let legacy =
+            json!({ "id": "agt_2", "provider": "codex", "cwd": "/repo", "runtimeInfo": { "sessionId": "s2" } });
+        write(&home.join("agents/agt_2.json"), &legacy.to_string());
+        let unstarted = json!({ "id": "agt_3", "provider": "claude", "cwd": "/repo", "persistence": null });
+        write(&home.join("agents/x/agt_3.json"), &unstarted.to_string());
+
+        let mut scan = Scan::default();
+        scan_paseo(&home, &mut scan).unwrap();
+        let by_id: HashMap<_, _> = scan.sessions.iter().map(|s| (s.native_id.as_str(), s)).collect();
+
+        let s1 = by_id["s1"];
+        assert_eq!(s1.driver, "claudeAgent", "persistence.provider wins over a custom provider id");
+        assert_eq!((s1.title.as_deref(), s1.model.as_deref()), (Some("T"), Some("m")));
+        assert!(s1.archived);
+        assert_eq!(s1.worktree_path.as_deref(), Some("/repo-wt"));
+        assert_eq!(s1.branch.as_deref(), Some("feat"));
+        assert_eq!(s1.project_root.as_deref(), Some("/repo"));
+
+        assert_eq!(by_id["s2"].driver, "codex", "legacy top-level file, runtimeInfo session id");
+        assert_eq!(scan.skipped.len(), 1);
+        assert!(scan.skipped[0].reason.contains("never started"));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn paseo_without_agents_dir_is_reported_not_an_error() {
+        let home = temp_dir();
+        let mut scan = Scan::default();
+        scan_paseo(&home, &mut scan).unwrap();
+        assert!(scan.sessions.is_empty());
+        assert!(scan.skipped[0].reason.contains("no agents/ directory"));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn claude_prefers_ai_title_and_ignores_sidechains_and_envelopes() {
+        let home = temp_dir();
+        let base = json!({ "sessionId": "c1", "cwd": "/w", "gitBranch": "main" });
+        let transcript = jsonl(&[
+            merged(&base, json!({ "type": "user", "isSidechain": true, "message": { "content": "sidechain prompt" } })),
+            merged(&base, json!({ "type": "user", "message": { "content": "<command-name>/clear</command-name>" } })),
+            merged(
+                &base,
+                json!({ "type": "user", "message": { "content": [{ "type": "text", "text": "Fix the bug" }] } }),
+            ),
+            merged(
+                &base,
+                json!({ "type": "assistant", "timestamp": "2026-01-01T00:01:00Z", "message": { "model": "claude-x" } }),
+            ),
+        ]);
+        write(&home.join("projects/-w/c1.jsonl"), &transcript);
+        write(&home.join("projects/-w/c2.jsonl"), &jsonl(&[json!({ "type": "mode", "sessionId": "c2" })]));
+        write(&home.join("projects/-w/c1/subagents/a.jsonl"), "{}\n");
+
+        let mut scan = Scan::default();
+        scan_claude(&home, &mut scan).unwrap();
+        assert_eq!(scan.sessions.len(), 1);
+        let s = &scan.sessions[0];
+        assert_eq!((s.native_id.as_str(), s.cwd.as_str()), ("c1", "/w"));
+        assert_eq!(s.title.as_deref(), Some("Fix the bug"));
+        assert_eq!(s.model.as_deref(), Some("claude-x"));
+        assert_eq!(s.updated_at.as_deref(), Some("2026-01-01T00:01:00Z"));
+        assert_eq!(s.branch.as_deref(), Some("main"));
+        assert_eq!(scan.skipped.len(), 1, "metadata-only transcript is skipped");
+
+        let titled = transcript + &jsonl(&[json!({ "type": "ai-title", "aiTitle": "Bug fix" })]);
+        write(&home.join("projects/-w/c1.jsonl"), &titled);
+        let mut scan = Scan::default();
+        scan_claude(&home, &mut scan).unwrap();
+        assert_eq!(scan.sessions[0].title.as_deref(), Some("Bug fix"));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn codex_skips_subagents_and_uses_session_index_names() {
+        let home = temp_dir();
+        let meta = |id: &str, extra: Value| {
+            let payload = merged(&json!({ "id": id, "cwd": "/w" }), extra);
+            json!({ "type": "session_meta", "timestamp": "2026-01-01T00:00:00Z", "payload": payload })
+        };
+        let prompt = json!({
+            "type": "event_msg", "timestamp": "2026-01-01T00:02:00Z",
+            "payload": { "type": "user_message", "message": " Add retries " },
+        });
+        let context = json!({ "type": "turn_context", "payload": { "model": "gpt-x" } });
+        let day = home.join("sessions/2026/01/01");
+        write(&day.join("rollout-a.jsonl"), &jsonl(&[meta("a", json!({})), context, prompt.clone()]));
+        let guardian = meta("b", json!({ "source": { "subagent": "guardian" } }));
+        write(&day.join("rollout-b.jsonl"), &jsonl(&[guardian, prompt.clone()]));
+        write(&day.join("rollout-c.jsonl"), &jsonl(&[meta("c", json!({ "parent_thread_id": "a" })), prompt.clone()]));
+        write(&home.join("archived_sessions/rollout-d.jsonl"), &jsonl(&[meta("d", json!({})), prompt]));
+        write(&home.join("session_index.jsonl"), &jsonl(&[json!({ "id": "d", "thread_name": "Named thread" })]));
+
+        let mut scan = Scan::default();
+        scan_codex(&home, &mut scan).unwrap();
+        let by_id: HashMap<_, _> = scan.sessions.iter().map(|s| (s.native_id.as_str(), s)).collect();
+        assert_eq!(by_id.len(), 2);
+        assert_eq!(by_id["a"].title.as_deref(), Some("Add retries"));
+        assert_eq!(by_id["a"].model.as_deref(), Some("gpt-x"));
+        assert_eq!(by_id["a"].updated_at.as_deref(), Some("2026-01-01T00:02:00Z"));
+        assert!(!by_id["a"].archived);
+        assert_eq!(by_id["d"].title.as_deref(), Some("Named thread"));
+        assert!(by_id["d"].archived);
+        assert_eq!(scan.skipped.iter().filter(|k| k.reason == "sub-agent thread").count(), 2);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn project_root_is_the_enclosing_repo_or_the_main_repo_of_a_worktree() {
+        let root = temp_dir();
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join(".git/worktrees/wt")).unwrap();
+        fs::create_dir_all(repo.join("sub/dir")).unwrap();
+        fs::write(repo.join(".git/worktrees/wt/HEAD"), "ref: refs/heads/feature/x\n").unwrap();
+        let wt = root.join("wt");
+        fs::create_dir_all(wt.join("src")).unwrap();
+        fs::write(wt.join(".git"), format!("gitdir: {}\n", repo.join(".git/worktrees/wt").display())).unwrap();
+
+        let mut s = session("codex", &repo.join("sub/dir"));
+        resolve_project_root(&mut s);
+        assert_eq!(s.project_root, Some(repo.display().to_string()));
+        assert_eq!(s.worktree_path, None);
+
+        let mut s = session("codex", &wt.join("src"));
+        resolve_project_root(&mut s);
+        assert_eq!(s.project_root, Some(repo.display().to_string()));
+        assert_eq!(s.worktree_path, Some(wt.display().to_string()));
+        assert_eq!(s.branch.as_deref(), Some("feature/x"));
+
+        let loose = root.join("loose");
+        fs::create_dir_all(&loose).unwrap();
+        let mut s = session("codex", &loose);
+        resolve_project_root(&mut s);
+        assert_eq!(s.project_root, Some(loose.display().to_string()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_threads_stay_at_their_exact_cwd() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join("repo/.git")).unwrap();
+        let sub = root.join("repo/sub");
+        fs::create_dir_all(&sub).unwrap();
+
+        let mut s = session("claudeAgent", &sub);
+        resolve_project_root(&mut s);
+        assert_eq!(s.project_root, Some(sub.display().to_string()), "Claude resumes by exact cwd");
+        assert_eq!(s.worktree_path, None);
+
+        let mut s = session("claudeAgent", &root.join("repo"));
+        resolve_project_root(&mut s);
+        assert_eq!(s.project_root, Some(root.join("repo").display().to_string()));
+        fs::remove_dir_all(root).unwrap();
+    }
 }

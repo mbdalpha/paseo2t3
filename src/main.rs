@@ -102,7 +102,10 @@ fn main() -> Result<()> {
         Command::Scan { sources, json } => {
             let scan = collect(&sources)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&json!({ "sessions": scan.sessions, "skipped": scan.skipped }))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({ "sessions": scan.sessions, "skipped": scan.skipped }))?
+                );
             } else {
                 print_plan(&scan);
             }
@@ -172,7 +175,8 @@ fn collect(args: &SourceArgs) -> Result<Scan> {
             continue;
         }
         if s.archived && !args.include_archived {
-            scan.skipped.push(sources::Skipped { origin: s.origin, reason: "archived (use --include-archived)".into() });
+            scan.skipped
+                .push(sources::Skipped { origin: s.origin, reason: "archived (use --include-archived)".into() });
             continue;
         }
         if let Some(since) = &args.since {
@@ -255,7 +259,11 @@ fn stable_id(kind: &str, key: &str) -> String {
 
 fn norm_root(p: &str) -> String {
     let t = p.trim_end_matches(['/', '\\']);
-    if cfg!(windows) { t.replace('/', "\\").to_lowercase() } else { t.to_string() }
+    if cfg!(windows) {
+        t.replace('/', "\\").to_lowercase()
+    } else {
+        t.to_string()
+    }
 }
 
 fn default_model(driver: &str) -> &'static str {
@@ -276,7 +284,9 @@ fn import(sessions: &[Session], target: &TargetArgs, runtime_mode: &str) -> Resu
     let token = match (&target.token_file, target.token.as_deref().filter(|t| !t.trim().is_empty())) {
         (Some(f), _) => std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?,
         (None, Some(t)) => t.to_string(),
-        (None, None) => bail!("pass --token-file or set T3_TOKEN (create one with `t3 auth session issue --token-only`)"),
+        (None, None) => {
+            bail!("pass --token-file or set T3_TOKEN (create one with `t3 auth session issue --token-only`)")
+        }
     };
     let mut t3 = t3::T3::new(&origin, &token);
     println!("\nImporting into {origin}");
@@ -378,4 +388,62 @@ fn import(sessions: &[Session], target: &TargetArgs, runtime_mode: &str) -> Resu
         bail!("{failed} item(s) failed");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(title: Option<&str>) -> Session {
+        Session {
+            driver: "claudeAgent".into(),
+            native_id: "0123456789abcdef".into(),
+            cwd: "/w".into(),
+            title: title.map(str::to_string),
+            model: None,
+            updated_at: None,
+            archived: false,
+            branch: None,
+            worktree_path: None,
+            project_root: None,
+            origin: String::new(),
+        }
+    }
+
+    #[test]
+    fn stable_ids_are_deterministic_uuids_scoped_by_kind() {
+        let a = stable_id("thread", "codex:1");
+        assert_eq!(a, stable_id("thread", "codex:1"));
+        assert_ne!(a, stable_id("thread.create", "codex:1"));
+        assert_ne!(a, stable_id("thread", "codex:2"));
+        let groups: Vec<_> = a.split('-').map(str::len).collect();
+        assert_eq!(groups, [8, 4, 4, 4, 12]);
+        assert_eq!(&a[14..15], "5", "version nibble");
+        assert!(matches!(&a[19..20], "8" | "9" | "a" | "b"), "RFC 4122 variant");
+    }
+
+    #[test]
+    fn titles_use_the_first_line_and_are_bounded() {
+        assert_eq!(title_for(&session(Some("\n  Fix it  \nmore detail"))), "Fix it");
+        let t = title_for(&session(Some(&"x".repeat(100))));
+        assert_eq!(t.chars().count(), 81);
+        assert!(t.ends_with('…'));
+        assert_eq!(title_for(&session(Some("   "))), "Imported Claude session 01234567");
+        assert_eq!(title_for(&session(None)), "Imported Claude session 01234567");
+    }
+
+    #[test]
+    fn roots_compare_without_trailing_separators() {
+        assert_eq!(norm_root("/a/b/"), norm_root("/a/b"));
+        if cfg!(windows) {
+            assert_eq!(norm_root(r"C:\Repo\"), norm_root("c:/repo"));
+        }
+    }
+
+    #[test]
+    fn unknown_models_fall_back_to_t3_defaults() {
+        assert_eq!(default_model("claudeAgent"), "claude-opus-5-5");
+        assert_eq!(default_model("codex"), "gpt-6-astra");
+        assert_eq!(default_model("opencode"), "openai/gpt-5");
+    }
 }

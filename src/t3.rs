@@ -24,7 +24,8 @@ pub struct Project {
 pub fn origin_from_home(home: &Path) -> Result<String> {
     let path = home.join("userdata").join("server-runtime.json");
     let v: Value = serde_json::from_str(
-        &std::fs::read_to_string(&path).with_context(|| format!("reading {} (is the T3 server running?)", path.display()))?,
+        &std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {} (is the T3 server running?)", path.display()))?,
     )?;
     v["origin"].as_str().map(str::to_string).ok_or_else(|| anyhow!("no origin in {}", path.display()))
 }
