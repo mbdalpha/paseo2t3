@@ -1,5 +1,8 @@
 # paseo2t3
 
+[![CI](https://github.com/mbdalpha/paseo2t3/actions/workflows/ci.yml/badge.svg)](https://github.com/mbdalpha/paseo2t3/actions/workflows/ci.yml)
+[![Nightly](https://github.com/mbdalpha/paseo2t3/actions/workflows/nightly.yml/badge.svg)](https://github.com/mbdalpha/paseo2t3/releases/tag/nightly)
+
 Ports Paseo agents into T3 Code. Each agent becomes a T3 thread bound to the agent's
 provider-native session (Claude Code session id, Codex thread id, OpenCode session id), so
 the next message sent in T3 resumes the original conversation.
@@ -34,6 +37,13 @@ Not carried over: Paseo's in-memory timeline (Paseo never stores one), schedules
 settings. Imported threads open **empty in T3's UI**: the history stays with the provider,
 which has full context when you resume. Providers T3 doesn't support here (Copilot, Pi,
 Antigravity, ...) are listed as skipped.
+
+## Install
+
+Nightly builds for Linux (x86_64/aarch64, static musl), macOS (arm64/x86_64) and Windows
+are on the [`nightly` release](https://github.com/mbdalpha/paseo2t3/releases/tag/nightly),
+with `SHA256SUMS`. A nightly is only published after the E2E suite passes on all three OSes.
+Or build it yourself: `cargo install --locked --git https://github.com/mbdalpha/paseo2t3`.
 
 ## Usage
 

@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      t3-version:
+        description: "t3 npm version for the E2E run (empty = the pin in e2e/package.json)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  e2e:
+    name: e2e (${{ matrix.os }}, t3 ${{ inputs.t3-version || 'pinned' }})
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+      - run: cargo build --release --locked
+      - name: Install t3
+        working-directory: e2e
+        shell: bash
+        run: |
+          npm ci --no-audit --no-fund
+          if [ -n "${{ inputs.t3-version }}" ]; then
+            npm install --no-save --no-audit --no-fund "t3@${{ inputs.t3-version }}"
+          fi
+          echo "T3_VERSION=$(node -p "require('t3/package.json').version")" >> "$GITHUB_ENV"
+      # The t3 launcher downloads a ~300 MB runtime per version; keep it between runs.
+      - uses: actions/cache@v4
+        with:
+          path: e2e/.cache
+          key: t3-runtime-${{ runner.os }}-${{ runner.arch }}-${{ env.T3_VERSION }}
+      - name: End-to-end test
+        working-directory: e2e
+        run: node run.mjs

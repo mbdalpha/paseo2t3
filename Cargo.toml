@@ -3,6 +3,13 @@ name = "paseo2t3"
 version = "0.1.0"
 edition = "2021"
 description = "Port Paseo agents (and native Claude Code / Codex sessions) into T3 Code as resumable threads"
+repository = "https://github.com/mbdalpha/paseo2t3"
+publish = false
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
 
 [dependencies]
 anyhow = "1"

@@ -1,0 +1,126 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Publish even if nothing changed since the last nightly"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.check.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: check
+        shell: bash
+        run: |
+          last=$(git rev-parse -q --verify "refs/tags/nightly^{commit}" || true)
+          if [ "${{ inputs.force }}" = "true" ] || [ "$last" != "$GITHUB_SHA" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "nightly already points at $GITHUB_SHA; nothing to publish"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Gates the release: the T3 version we pin and document.
+  test-pinned:
+    uses: ./.github/workflows/ci.yml
+
+  # Early warning when a new T3 release breaks the import path; does not block the release.
+  test-latest-t3:
+    uses: ./.github/workflows/ci.yml
+    with:
+      t3-version: latest
+
+  build:
+    needs: changes
+    if: needs.changes.outputs.publish == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, musl: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          name=paseo2t3-${{ matrix.target }}
+          mkdir -p dist "$name"
+          cp README.md "$name/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/paseo2t3.exe" "$name/"
+            7z a -tzip "dist/$name.zip" "$name" > /dev/null
+          else
+            cp "target/${{ matrix.target }}/release/paseo2t3" "$name/"
+            tar -czf "dist/$name.tar.gz" "$name"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: [changes, test-pinned, build]
+    if: needs.changes.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Publish the rolling nightly prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          t3_pin=$(node -p "require('./e2e/package.json').dependencies.t3")
+          notes="Nightly build of ${GITHUB_SHA::7} ($(date -u +%F)).
+
+          E2E-tested against T3 Code ${t3_pin} on Linux, Windows and macOS.
+          Known T3 issue: the first message in an imported Claude thread fails; send it again.
+          See the README for details."
+          gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
+          gh release create nightly dist/* \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Nightly $(date -u +%F) (${GITHUB_SHA::7})" \
+            --notes "$notes"
