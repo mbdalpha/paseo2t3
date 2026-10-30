@@ -1,2 +1,5 @@
 /target
-/trial/out/
+/e2e/node_modules/
+/e2e/.cache/
+/trial/
+*.log

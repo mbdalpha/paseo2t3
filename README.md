@@ -27,6 +27,8 @@ the thread has a recorded provider turn, so the first open asks Claude Code to c
 session under the existing id, which it refuses. That failed attempt records a turn; send the
 message again and the thread resumes the original session with full history (verified with a
 codeword planted in a throwaway session). Codex threads are not affected by this check.
+Tracked upstream as [t3code#15243](https://github.com/pingdotgg/t3code/issues/15243), with a fix
+in [t3code#23219](https://github.com/pingdotgg/t3code/pull/23219).
 
 Not carried over: Paseo's in-memory timeline (Paseo never stores one), schedules, voice
 settings. Imported threads open **empty in T3's UI**: the history stays with the provider,
@@ -60,8 +62,18 @@ paseo2t3 import --t3-home ~/.t3 --token-file /tmp/t3-token --apply
 - Claude sessions are placed at their exact original cwd, because Claude Code looks a
   session up by cwd when resuming.
 
-## Trial
+## Testing
 
-`trial/make-fixture.js` writes a Paseo-shaped home covering each case (worktree, archived,
-legacy layout, unsupported provider, never-started, internal, corrupt file, missing dir).
-Run T3 against a scratch home (`t3 serve --base-dir <scratch>`), never your real `~/.t3`.
+```sh
+cargo test                      # parsers and helpers
+cargo build --release
+cd e2e && npm ci && npm test    # end to end against a real T3 Code server
+```
+
+The E2E run builds fixture Paseo, Claude Code and Codex stores (worktree, archived, legacy
+layout, unsupported provider, never-started, internal, corrupt file, missing directory,
+sub-agent thread), starts `t3 serve` on a temporary data directory and a free port, imports
+everything, checks what T3 persisted (native session refs, archive state, worktree and branch,
+titles, project count), then re-imports to prove nothing is duplicated. It never touches
+`~/.t3`: the T3 runtime is cached in `e2e/.cache` (override with `T3_RUNTIME_HOME`). It needs
+Node 22.13+ and git, and makes no model calls.

@@ -1,0 +1,12 @@
+{
+  "name": "paseo2t3-e2e",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end test for paseo2t3 against a real, isolated T3 Code server",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "dependencies": {
+    "t3": "0.1.5"
+  }
+}
