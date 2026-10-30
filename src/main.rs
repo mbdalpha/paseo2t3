@@ -89,8 +89,9 @@ struct TargetArgs {
     /// T3 home of a running server; its origin is read from userdata/server-runtime.json.
     #[arg(long)]
     t3_home: Option<PathBuf>,
-    /// File holding a bearer token from `t3 auth session issue --token-only`.
-    #[arg(long, conflicts_with = "token")]
+    /// File holding a bearer token from `t3 auth session issue --token-only`. Takes
+    /// precedence over T3_TOKEN.
+    #[arg(long)]
     token_file: Option<PathBuf>,
     #[arg(long, env = "T3_TOKEN", hide_env_values = true)]
     token: Option<String>,
@@ -272,9 +273,9 @@ fn import(sessions: &[Session], target: &TargetArgs, runtime_mode: &str) -> Resu
         (None, Some(home)) => t3::origin_from_home(home)?,
         (None, None) => bail!("name the T3 server with --t3-url or --t3-home (there is deliberately no default)"),
     };
-    let token = match (&target.token_file, &target.token) {
+    let token = match (&target.token_file, target.token.as_deref().filter(|t| !t.trim().is_empty())) {
         (Some(f), _) => std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?,
-        (None, Some(t)) => t.clone(),
+        (None, Some(t)) => t.to_string(),
         (None, None) => bail!("pass --token-file or set T3_TOKEN (create one with `t3 auth session issue --token-only`)"),
     };
     let mut t3 = t3::T3::new(&origin, &token);
