@@ -174,13 +174,18 @@ fn collect(args: &SourceArgs) -> Result<Scan> {
         }
     };
 
+    // An archived sub-agent of a live agent is kept (and archived in T3), so the live agent's
+    // thread lists all of its sub-agents.
+    let live_agents: HashSet<String> =
+        scan.sessions.iter().filter(|s| !s.archived).filter_map(|s| s.agent_id.clone()).collect();
     let mut seen = HashSet::new();
     let sessions = std::mem::take(&mut scan.sessions);
     for mut s in sessions {
         if !seen.insert((s.driver.clone(), s.native_id.clone())) {
             continue;
         }
-        if s.archived && !args.include_archived {
+        let live_parent = s.parent_agent_id.as_ref().is_some_and(|p| live_agents.contains(p));
+        if s.archived && !args.include_archived && !live_parent {
             scan.skipped
                 .push(sources::Skipped { origin: s.origin, reason: "archived (use --include-archived)".into() });
             continue;
@@ -443,6 +448,12 @@ fn link_outcome(
     link: &mut bool,
     failed: &mut usize,
 ) {
+    // T3 cannot start Claude Code in a directory that is gone (a deleted worktree), and
+    // Claude Code could not resume the session there anyway.
+    if !Path::new(&s.cwd).is_dir() {
+        println!("    not linked: {} no longer exists", s.cwd);
+        return;
+    }
     // Without the transcript where Claude Code looks it up, the "throwaway" turn would start
     // a new session under this id and reach the model instead of failing.
     let transcript = claude_transcript(claude_home, &s.cwd, &s.native_id);
@@ -591,6 +602,8 @@ mod tests {
             worktree_path: None,
             project_root: None,
             origin: String::new(),
+            agent_id: None,
+            parent_agent_id: None,
         }
     }
 

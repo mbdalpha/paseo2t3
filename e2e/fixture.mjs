@@ -50,8 +50,9 @@ export function writePaseoHome(home, { demo, worktree, plain }) {
   const persist = (provider, sessionId) => ({ persistence: { provider, sessionId, nativeHandle: sessionId } });
   const agents = [
     agent("agt_claude", "claude", plain, { workspaceId: "wks_plain", title: "Claude via Paseo", config: { provider: "claude", cwd: plain, model: "claude-haiku-5-5" }, ...persist("claude", IDS.claudeViaPaseo) }),
-    agent("agt_codex_wt", "codex", worktree, { workspaceId: "wks_feature", title: "Feature work in worktree", config: { provider: "codex", cwd: worktree, model: "gpt-6.1-sol" }, ...persist("codex", IDS.codexWorktree) }),
-    agent("agt_codex_archived", "codex", demo, { workspaceId: "wks_demo", title: "Old archived task", archivedAt: NOW, ...persist("codex", IDS.codexArchived) }),
+    // Sub-agents of agt_claude: one live, one archived (kept even without --include-archived).
+    agent("agt_codex_wt", "codex", worktree, { workspaceId: "wks_feature", title: "Feature work in worktree", labels: { "paseo.parent-agent-id": "agt_claude" }, config: { provider: "codex", cwd: worktree, model: "gpt-6.1-sol" }, ...persist("codex", IDS.codexWorktree) }),
+    agent("agt_codex_archived", "codex", demo, { workspaceId: "wks_demo", title: "Old archived task", labels: { "paseo.parent-agent-id": "agt_claude" }, archivedAt: NOW, ...persist("codex", IDS.codexArchived) }),
     agent("agt_copilot", "copilot", demo, { workspaceId: "wks_demo", title: "Copilot agent", ...persist("copilot", "copilot-123") }),
     agent("agt_never_started", "claude", demo, { workspaceId: "wks_demo", title: "Never ran", persistence: null }),
     agent("agt_internal", "claude", demo, { internal: true, ...persist("claude", "internal-1") }),

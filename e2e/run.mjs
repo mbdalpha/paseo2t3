@@ -4,6 +4,8 @@
 //   PASEO2T3_BIN   path to the built paseo2t3 binary (default: target/release/paseo2t3)
 //   T3_RUNTIME_HOME  where the t3 launcher caches its runtime (default: e2e/.cache/t3)
 //   E2E_KEEP=1     keep the temp directory for inspection
+//   T3_SRC         a T3 Code source checkout of the same version with `pnpm install` done;
+//                  when set, also runs t3-history/backfill.ts (needs Node 26: T3_NODE)
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
@@ -130,6 +132,10 @@ try {
   assert.equal(path.resolve(wt.project_root), path.resolve(demo));
   assert.equal(path.resolve(wt.worktree_path), path.resolve(worktree));
   assert.equal(wt.branch, "feature/x");
+  assert.equal(wt.parent_agent_id, "agt_claude");
+  const withoutArchived = JSON.parse(tool("scan", ...common.filter((a) => a !== "--include-archived"), "--json"));
+  const kept = withoutArchived.sessions.map((s) => s.native_id);
+  assert.ok(kept.includes(IDS.codexArchived), "an archived sub-agent of a live agent is kept");
   log("scan ok");
 
   // T3 runs Claude threads through a stub, so linking is checked without model calls.
@@ -239,6 +245,32 @@ try {
   assert.equal(db2.prepare("SELECT count(*) AS n FROM orchestration_v2_projection_threads").get().n, 6, "no duplicate threads");
   db2.close();
   log("idempotent re-run ok");
+
+  if (process.env.T3_SRC) {
+    const scanFile = p("scan.json");
+    fs.writeFileSync(scanFile, tool("scan", ...common, "--json"));
+    const script = path.join(process.env.T3_SRC, "apps", "server", "src", "paseo2t3-backfill.ts");
+    fs.copyFileSync(path.join(repoRoot, "t3-history", "backfill.ts"), script);
+    const backfill = (...extra) => {
+      const out = execFileSync(process.env.T3_NODE || process.execPath, [script, "--db", path.join(t3Data, "userdata", "statev2.sqlite"), "--scan", scanFile, "--claude-home", p("claude"), "--codex-home", p("codex"), ...extra], { cwd: path.dirname(script), encoding: "utf8" });
+      return JSON.parse(out.slice(out.indexOf("{")));
+    };
+    try {
+      const applied = backfill("--apply");
+      assert.equal(applied.history, 2, `history for the native Claude and Codex sessions: ${JSON.stringify(applied)}`);
+      assert.equal(applied.nested, 2, `both sub-agents nested: ${JSON.stringify(applied)}`);
+      assert.equal(backfill().threads, 0, "a second backfill has nothing to do");
+    } finally {
+      fs.rmSync(script, { force: true });
+    }
+    // The running server serves both without a restart.
+    const claudeThread = JSON.parse(t3("thread", "show", refs.get(IDS.claudeNative).threadId, "--base-dir", t3Data, "--messages", "10", "--json"));
+    const texts = JSON.stringify(claudeThread);
+    assert.ok(texts.includes("Refactor the parser") && texts.includes("Done."), `history shown: ${texts.slice(0, 500)}`);
+    const child = await rpc(origin, token, "orchestration.getThreadProjection", { threadId: refs.get(IDS.codexWorktree).threadId });
+    assert.deepEqual(child.thread.lineage, { parentThreadId: unlinked, relationshipToParent: "subagent", rootThreadId: unlinked });
+    log("history backfill and sub-agent nesting ok");
+  }
 
   log("PASS");
 } catch (e) {
