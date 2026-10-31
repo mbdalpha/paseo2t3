@@ -25,6 +25,12 @@ pub struct Session {
     pub project_root: Option<String>,
     /// Where we found it, e.g. `paseo:agt_123` or `claude:<file>`.
     pub origin: String,
+    /// The Paseo agent this session belongs to, and the agent that started it (Paseo's
+    /// `paseo.parent-agent-id` label), so sub-agents can be nested under their parent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -162,6 +168,8 @@ pub fn scan_paseo(home: &Path, scan: &mut Scan) -> Result<()> {
                 .or_else(|| project.and_then(|p| str_field(p, &["rootPath"])))
                 .map(str::to_string),
             origin,
+            agent_id: str_field(&agent, &["id"]).map(str::to_string),
+            parent_agent_id: str_field(&agent, &["labels", "paseo.parent-agent-id"]).map(str::to_string),
         });
     }
     Ok(())
@@ -255,6 +263,8 @@ fn read_claude_session(file: &Path) -> Result<Option<Session>> {
         worktree_path: None,
         project_root: None,
         origin: String::new(),
+        agent_id: None,
+        parent_agent_id: None,
     }))
 }
 
@@ -363,6 +373,8 @@ fn read_codex_session(file: &Path, names: &HashMap<String, String>) -> Result<Re
         worktree_path: None,
         project_root: None,
         origin: String::new(),
+        agent_id: None,
+        parent_agent_id: None,
     }))
 }
 
@@ -468,6 +480,8 @@ mod tests {
             worktree_path: None,
             project_root: None,
             origin: String::new(),
+            agent_id: None,
+            parent_agent_id: None,
         }
     }
 

@@ -23,6 +23,9 @@ Built against Paseo 0.11.3 and T3 Code 0.1.5.
 | title, model                   | thread title, model selection                 |
 | worktree workspace + branch    | thread `worktreePath` + `branch`              |
 | archived agent                 | archived thread (with `--include-archived`)   |
+| archived sub-agent of a live agent | archived thread, always                   |
+| conversation so far            | thread messages (`t3-history/backfill.ts`)    |
+| sub-agent (`paseo.parent-agent-id`) | thread nested under its parent (`t3-history/backfill.ts`) |
 
 **Claude threads are linked on import.** T3 Code (0.1.5 and main as of 2026-10-31) passes
 `resume` to Claude Code only once a thread has a recorded provider turn. Left alone, the first
@@ -44,9 +47,10 @@ first turn would start a new session and reach the model, so the import prints
 stops linking. `--no-link` turns linking off.
 
 Not carried over: Paseo's in-memory timeline (Paseo never stores one), schedules, voice
-settings. Imported threads open **empty in T3's UI**: the history stays with the provider,
-which has full context when you resume. Providers T3 doesn't support here (Copilot, Pi,
-Antigravity, ...) are listed as skipped.
+settings. `import` alone leaves threads **empty in T3's UI** (the provider still has the full
+context when you resume); run the history backfill below to show the conversation and nest
+sub-agents. Providers T3 doesn't support here (Copilot, Pi, Antigravity, ...) are listed as
+skipped.
 
 ## Install
 
@@ -84,6 +88,41 @@ paseo2t3 import --t3-home ~/.t3 --token-file /tmp/t3-token --apply
 - Claude sessions are placed at their exact original cwd, because Claude Code looks a
   session up by cwd when resuming.
 
+## History and sub-agents
+
+T3's public API can create a thread but not give it past messages or a parent. T3's own
+session importer, which does write history, skips any session another thread already owns.
+`t3-history/backfill.ts` therefore writes those events itself, through T3's own event store,
+projection code and transcript parser, so the result is what T3's importer would write:
+
+- each thread gets the user and assistant messages of its Claude Code or Codex transcript
+  (the first message plus the latest 199), ahead of anything sent in T3;
+- each Paseo sub-agent's thread becomes a sub-agent of its parent's thread, so it shows
+  under the parent (T3's relationships menu) instead of in the sidebar. It is still a normal
+  thread you can open and message.
+
+It runs from a T3 Code source checkout of the same version as the server, with Node 26:
+
+```sh
+git clone --depth 1 --branch v0.1.5 https://github.com/pingdotgg/t3code
+(cd t3code && corepack pnpm install --filter 't3...' --frozen-lockfile --ignore-scripts)
+cp t3-history/backfill.ts t3code/apps/server/src/paseo2t3-backfill.ts
+
+paseo2t3 scan --source paseo,claude,codex --json > scan.json    # same sources as the import
+sqlite3 ~/.t3/userdata/statev2.sqlite ".backup statev2.before-backfill.sqlite"
+cd t3code/apps/server/src
+node paseo2t3-backfill.ts --db ~/.t3/userdata/statev2.sqlite --scan /path/to/scan.json
+node paseo2t3-backfill.ts --db ~/.t3/userdata/statev2.sqlite --scan /path/to/scan.json --apply
+```
+
+- It writes to T3's database directly, so take the backup first. It works while the server
+  runs: each thread is one transaction, retried if the server holds the write lock. Reload
+  the T3 page afterwards so the sidebar picks up the nesting.
+- Re-running is safe: event ids are derived from the thread, and threads already done are
+  skipped.
+- Transcripts are streamed and reduced to the fields T3's parser reads, so multi-hundred-MB
+  Codex rollouts are fine.
+
 ## Testing
 
 ```sh
@@ -100,5 +139,7 @@ titles, project count), then re-imports to prove nothing is duplicated. It never
 `~/.t3`: the T3 runtime is cached in `e2e/.cache` (override with `T3_RUNTIME_HOME`). T3 runs
 Claude threads through `e2e/fake-claude.mjs`, which logs its arguments and fails every turn, so
 the run checks that the link turn asks for `--session-id`, that the next message asks for
-`--resume`, and that a re-import restores a title T3 replaced. It needs Node 22.13+ and git,
-and makes no model calls.
+`--resume`, and that a re-import restores a title T3 replaced. With `T3_SRC` (a prepared T3
+source checkout) and `T3_NODE` (Node 26) set, it also runs the history backfill against the
+running server and checks the messages and the sub-agent nesting. It needs Node 22.13+ and
+git, and makes no model calls.
