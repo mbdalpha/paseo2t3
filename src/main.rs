@@ -1,7 +1,7 @@
 mod sources;
 mod t3;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -105,7 +105,7 @@ struct TargetArgs {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Scan { sources, json } => {
-            let scan = collect(&sources)?;
+            let scan = collect(&sources, false)?;
             if json {
                 println!(
                     "{}",
@@ -117,20 +117,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Import { sources, target, apply, runtime_mode, no_path_check, no_link } => {
-            let mut scan = collect(&sources)?;
-            if !no_path_check {
-                let (keep, missing): (Vec<_>, Vec<_>) = scan
-                    .sessions
-                    .drain(..)
-                    .partition(|s| s.project_root.as_deref().is_some_and(|r| Path::new(r).is_dir()));
-                scan.sessions = keep;
-                for s in missing {
-                    scan.skipped.push(sources::Skipped {
-                        origin: s.origin,
-                        reason: format!("project root {} does not exist here", s.project_root.unwrap_or_default()),
-                    });
-                }
-            }
+            let scan = collect(&sources, !no_path_check)?;
             print_plan(&scan);
             if !apply {
                 println!("\nDry run: nothing was written. Re-run with --apply to import.");
@@ -149,7 +136,7 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn collect(args: &SourceArgs) -> Result<Scan> {
+fn collect(args: &SourceArgs, require_roots: bool) -> Result<Scan> {
     let mut scan = Scan::default();
     let wanted: HashSet<Source> = args.source.iter().copied().collect();
     // Paseo first: its records carry titles and workspace info, and win de-duplication.
@@ -174,20 +161,10 @@ fn collect(args: &SourceArgs) -> Result<Scan> {
         }
     };
 
-    // An archived sub-agent of a live agent is kept (and archived in T3), so the live agent's
-    // thread lists all of its sub-agents.
-    let live_agents: HashSet<String> =
-        scan.sessions.iter().filter(|s| !s.archived).filter_map(|s| s.agent_id.clone()).collect();
     let mut seen = HashSet::new();
-    let sessions = std::mem::take(&mut scan.sessions);
-    for mut s in sessions {
+    let mut kept = Vec::new();
+    for mut s in std::mem::take(&mut scan.sessions) {
         if !seen.insert((s.driver.clone(), s.native_id.clone())) {
-            continue;
-        }
-        let live_parent = s.parent_agent_id.as_ref().is_some_and(|p| live_agents.contains(p));
-        if s.archived && !args.include_archived && !live_parent {
-            scan.skipped
-                .push(sources::Skipped { origin: s.origin, reason: "archived (use --include-archived)".into() });
             continue;
         }
         if let Some(since) = &args.since {
@@ -205,6 +182,24 @@ fn collect(args: &SourceArgs) -> Result<Scan> {
             }
         }
         sources::resolve_project_root(&mut s);
+        if require_roots && !s.project_root.as_deref().is_some_and(|r| Path::new(r).is_dir()) {
+            let reason = format!("project root {} does not exist here", s.project_root.unwrap_or_default());
+            scan.skipped.push(sources::Skipped { origin: s.origin, reason });
+            continue;
+        }
+        kept.push(s);
+    }
+    // An archived sub-agent of a live agent that is being imported is kept (and archived in
+    // T3), so the live agent's thread lists all of its sub-agents. Decided after every other
+    // filter, so a parent filtered out above does not pull its archived children in.
+    let live_agents: HashSet<String> = kept.iter().filter(|s| !s.archived).filter_map(|s| s.agent_id.clone()).collect();
+    for s in kept {
+        let live_parent = s.parent_agent_id.as_ref().is_some_and(|p| live_agents.contains(p));
+        if s.archived && !args.include_archived && !live_parent {
+            scan.skipped
+                .push(sources::Skipped { origin: s.origin, reason: "archived (use --include-archived)".into() });
+            continue;
+        }
         scan.sessions.push(s);
     }
     scan.sessions.sort_by(|a, b| (&a.project_root, &b.updated_at).cmp(&(&b.project_root, &a.updated_at)));
@@ -301,13 +296,12 @@ fn import(sessions: &[Session], target: &TargetArgs, runtime_mode: &str, claude_
     };
     let mut t3 = t3::T3::new(&origin, &token);
     println!("\nImporting into {origin}");
-    let mut link = claude_home.is_some();
-    let claude_home = claude_home.unwrap_or(Path::new(""));
 
     let mut projects: HashMap<String, String> =
         t3.projects()?.into_iter().map(|p| (norm_root(&p.workspace_root), p.id)).collect();
 
     let (mut created, mut existing, mut failed) = (0usize, 0usize, 0usize);
+    let mut links = Vec::new();
     for s in sessions {
         let root = s.project_root.clone().unwrap_or_else(|| s.cwd.clone());
         let key = norm_root(&root);
@@ -334,6 +328,7 @@ fn import(sessions: &[Session], target: &TargetArgs, runtime_mode: &str, claude_
         let thread_key = format!("{}:{}", s.driver, s.native_id);
         let thread_id = stable_id("thread", &thread_key);
         let title = title_for(s);
+        let link_home = claude_home.filter(|_| s.driver == "claudeAgent");
         if let Ok(projection) = t3.rpc("orchestration.getThreadProjection", json!({ "threadId": thread_id })) {
             existing += 1;
             println!("  = thread {} {}  already imported", s.driver, short(&s.native_id));
@@ -344,8 +339,14 @@ fn import(sessions: &[Session], target: &TargetArgs, runtime_mode: &str, claude_
             if let Err(e) = restore_title(&mut t3, &projection, &thread_key) {
                 println!("    ! title restore failed: {e:#}");
             }
-            if link && s.driver == "claudeAgent" && thread["archivedAt"].is_null() {
-                link_outcome(&mut t3, &projection, s, claude_home, &mut link, &mut failed);
+            if let Some(home) = link_home.filter(|_| thread["archivedAt"].is_null()) {
+                match LinkJob::new(&projection, s, home, &thread_id, &thread_key, false) {
+                    Ok(job) => links.extend(job),
+                    Err(e) => {
+                        failed += 1;
+                        println!("    ! not linked: {e:#}");
+                    }
+                }
             }
             continue;
         }
@@ -375,43 +376,39 @@ fn import(sessions: &[Session], target: &TargetArgs, runtime_mode: &str, claude_
                 "metadata": metadata,
             },
         });
-        match t3.dispatch(command) {
-            Ok(_) => {
-                created += 1;
-                println!("  + thread {} {}  {title}", s.driver, short(&s.native_id));
-                // Link before archiving: an archived thread should not start turns.
-                if link && s.driver == "claudeAgent" {
-                    match t3.rpc("orchestration.getThreadProjection", json!({ "threadId": thread_id })) {
-                        Ok(projection) => link_outcome(&mut t3, &projection, s, claude_home, &mut link, &mut failed),
-                        Err(e) => {
-                            failed += 1;
-                            println!("    ! link failed: {e:#}");
-                        }
-                    }
+        if let Err(e) = t3.dispatch(command) {
+            failed += 1;
+            println!("  ! thread {} {}: {e:#}", s.driver, short(&s.native_id));
+            continue;
+        }
+        created += 1;
+        println!("  + thread {} {}  {title}", s.driver, short(&s.native_id));
+        // An archived thread should not start turns, so one that gets linked is archived
+        // once its link turn settles.
+        let mut job = None;
+        if let Some(home) = link_home {
+            let job_for = |p: Value| LinkJob::new(&p, s, home, &thread_id, &thread_key, s.archived);
+            match t3.rpc("orchestration.getThreadProjection", json!({ "threadId": thread_id })).and_then(job_for) {
+                Ok(j) => job = j,
+                Err(e) => {
+                    failed += 1;
+                    println!("    ! not linked: {e:#}");
                 }
-                if s.archived {
-                    let archive = json!({
-                        "type": "thread.archive",
-                        "commandId": stable_id("thread.archive", &thread_key),
-                        "threadId": thread_id,
-                    });
-                    if let Err(e) = t3.dispatch(archive) {
-                        println!("    ! archive failed: {e:#}");
-                    }
-                }
-            }
-            Err(e) => {
-                failed += 1;
-                println!("  ! thread {} {}: {e:#}", s.driver, short(&s.native_id));
             }
         }
+        match job {
+            Some(job) => links.push(job),
+            None if s.archived => archive(&mut t3, &thread_id, &thread_key),
+            None => {}
+        }
     }
+    failed += link_all(&mut t3, links);
     println!("\nDone: {created} imported, {existing} already present, {failed} failure(s).");
-    if !link && sessions.iter().any(|s| s.driver == "claudeAgent") {
+    if claude_home.is_none() && sessions.iter().any(|s| s.driver == "claudeAgent") {
         println!(
-            "\nNote: Claude threads were not linked. In T3 Code 0.1.5 the first message in an\n\
-             unlinked imported Claude thread fails with \"Provider turn failed\"; send it again\n\
-             and the thread resumes the original session."
+            "\nNote: Claude threads were not linked (--no-link). In T3 Code 0.1.5 the first message\n\
+             in an unlinked imported Claude thread fails with \"Provider turn failed\"; send it\n\
+             again and the thread resumes the original session."
         );
     }
     if failed > 0 {
@@ -420,111 +417,245 @@ fn import(sessions: &[Session], target: &TargetArgs, runtime_mode: &str, claude_
     Ok(())
 }
 
+fn archive(t3: &mut t3::T3, thread_id: &str, thread_key: &str) {
+    let archive = json!({
+        "type": "thread.archive",
+        "commandId": stable_id("thread.archive", thread_key),
+        "threadId": thread_id,
+    });
+    if let Err(e) = t3.dispatch(archive) {
+        println!("    ! archive {thread_id} failed: {e:#}");
+    }
+}
+
 /// The note sent as the throwaway first turn of an imported Claude thread. Claude Code
 /// rejects that turn before any model call, and T3 hands the note to the next turn as
 /// earlier context, so it must read as information rather than a request.
 fn link_note(native_id: &str) -> String {
     format!(
-        "[paseo2t3] Imported Claude Code session {native_id}. Earlier messages are not shown \
+        "{LINK_NOTE_PREFIX} Imported Claude Code session {native_id}. Earlier messages are not shown \
          in T3; the session keeps them. T3 Code cannot resume a session on a thread's first \
          turn (t3code#15243), so this turn fails and the next message continues the session."
     )
 }
 
-enum Link {
-    /// The thread already has a provider turn, so T3 will resume it.
-    AlreadyLinked,
-    /// The throwaway turn failed as expected and left a provider turn behind.
-    Linked,
-    /// T3 resumed the session on its first turn: this T3 no longer needs linking.
-    Resumed,
-}
+const LINK_NOTE_PREFIX: &str = "[paseo2t3]";
 
-fn link_outcome(
-    t3: &mut t3::T3,
-    projection: &Value,
-    s: &Session,
-    claude_home: &Path,
-    link: &mut bool,
-    failed: &mut usize,
-) {
-    // T3 cannot start Claude Code in a directory that is gone (a deleted worktree), and
-    // Claude Code could not resume the session there anyway.
-    if !Path::new(&s.cwd).is_dir() {
-        println!("    not linked: {} no longer exists", s.cwd);
-        return;
-    }
-    // Without the transcript where Claude Code looks it up, the "throwaway" turn would start
-    // a new session under this id and reach the model instead of failing.
-    let transcript = claude_transcript(claude_home, &s.cwd, &s.native_id);
-    if !transcript.is_file() {
-        println!("    not linked: no transcript at {}", transcript.display());
-        return;
-    }
-    match link_claude_thread(t3, projection, s) {
-        Ok(Link::AlreadyLinked) => {}
-        Ok(Link::Linked) => println!("    linked: the next message resumes session {}", short(&s.native_id)),
-        Ok(Link::Resumed) => {
-            println!("    T3 resumed the session on its first turn, so linking is not needed; skipping it from here");
-            *link = false;
-        }
-        Err(e) => {
-            *failed += 1;
-            println!("    ! link failed: {e:#}");
-        }
-    }
-}
+/// How many link turns run at once, each starting its own Claude Code process.
+const PARALLEL_LINKS: usize = 8;
+const LINK_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// T3 Code 0.1.5 passes `resume` to Claude Code only once the thread has a recorded provider
 /// turn (t3code#15243). Without one, the first message asks Claude Code to create a session
 /// under the imported id, which it refuses, so the user's first message fails and, because
 /// the thread has no messages yet, T3 also retitles the thread from it. Sending one note
 /// first takes that failure here, before the user ever opens the thread.
-fn link_claude_thread(t3: &mut t3::T3, projection: &Value, s: &Session) -> Result<Link> {
-    let thread_key = format!("{}:{}", s.driver, s.native_id);
-    let thread_id = stable_id("thread", &thread_key);
-    if has_provider_turn(projection) {
-        return Ok(Link::AlreadyLinked);
-    }
-    if active_run(projection) {
-        bail!("the thread has a run in progress; re-run the import once it finishes");
-    }
-    let run_count = |p: &Value| p["runs"].as_array().map_or(0, Vec::len);
-    let runs_before = run_count(projection);
-    t3.dispatch(json!({
-        "type": "message.dispatch",
-        "commandId": stable_id("thread.link", &thread_key),
-        "threadId": thread_id,
-        "messageId": stable_id("message.link", &thread_key),
-        "text": link_note(&s.native_id),
-        "attachments": [],
-        "createdBy": "user",
-        "creationSource": "web",
-        "dispatchMode": { "type": "start_immediately" },
-    }))?;
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        std::thread::sleep(Duration::from_millis(300));
-        let p = t3.rpc("orchestration.getThreadProjection", json!({ "threadId": thread_id }))?;
-        if has_provider_turn(&p) && !active_run(&p) {
-            let resumed = p["runs"].as_array().into_iter().flatten().any(|r| r["status"] == "completed");
-            return Ok(if resumed { Link::Resumed } else { Link::Linked });
+struct LinkJob {
+    thread_id: String,
+    thread_key: String,
+    native_id: String,
+    /// Runs that existed before the link turn, to tell the link turn's run apart.
+    runs_before: HashSet<String>,
+    archive: bool,
+}
+
+enum LinkState {
+    Pending,
+    /// The turn failed as expected and left a provider turn behind.
+    Linked,
+    /// The turn reached the model: this T3 resumes on the first turn and needs no linking.
+    Resumed(String),
+    Failed(anyhow::Error),
+    TimedOut,
+}
+
+impl LinkJob {
+    /// The link to make for a thread, or None when it needs none or cannot be linked.
+    fn new(
+        projection: &Value,
+        s: &Session,
+        claude_home: &Path,
+        thread_id: &str,
+        thread_key: &str,
+        archive: bool,
+    ) -> Result<Option<LinkJob>> {
+        if has_provider_turn(projection) {
+            return Ok(None);
         }
-        if !active_run(&p) && run_count(&p) > runs_before {
-            bail!("the first turn ended without reaching Claude Code (is the claude CLI installed for T3?)");
+        // T3 cannot start Claude Code in a directory that is gone (a deleted worktree), and
+        // Claude Code could not resume the session there anyway.
+        if !Path::new(&s.cwd).is_dir() {
+            println!("    not linked: {} no longer exists", s.cwd);
+            return Ok(None);
         }
-        if Instant::now() > deadline {
-            bail!("timed out waiting for the first turn to finish");
+        // Without the transcript where Claude Code looks it up, the "throwaway" turn would start
+        // a new session under this id and reach the model instead of failing.
+        let transcript = claude_transcript(claude_home, &s.cwd, &s.native_id);
+        if !transcript.is_file() {
+            println!("    not linked: no transcript at {}", transcript.display());
+            return Ok(None);
+        }
+        if active_run(projection) {
+            bail!("the thread has a run in progress; re-run the import once it finishes");
+        }
+        Ok(Some(LinkJob {
+            thread_id: thread_id.to_string(),
+            thread_key: thread_key.to_string(),
+            native_id: s.native_id.clone(),
+            runs_before: run_ids(projection).map(str::to_string).collect(),
+            archive,
+        }))
+    }
+
+    fn dispatch(&self, t3: &mut t3::T3) -> Result<()> {
+        // T3 answers a repeated commandId from its receipt without running anything, so each
+        // attempt needs its own; every attempt adds a run, which makes the run count one.
+        let attempt = format!("{}\0{}", self.thread_key, self.runs_before.len());
+        t3.dispatch(json!({
+            "type": "message.dispatch",
+            "commandId": stable_id("thread.link", &attempt),
+            "threadId": self.thread_id,
+            "messageId": stable_id("message.link", &attempt),
+            "text": link_note(&self.native_id),
+            "attachments": [],
+            "createdBy": "user",
+            "creationSource": "web",
+            "dispatchMode": { "type": "start_immediately" },
+        }))?;
+        Ok(())
+    }
+
+    fn poll(&self, t3: &mut t3::T3) -> LinkState {
+        match t3.rpc("orchestration.getThreadProjection", json!({ "threadId": self.thread_id })) {
+            Ok(p) => link_state(&p, &self.runs_before),
+            Err(e) => LinkState::Failed(e),
         }
     }
 }
 
+fn link_state(p: &Value, runs_before: &HashSet<String>) -> LinkState {
+    let runs: Vec<&Value> = p["runs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["id"].as_str().is_some_and(|id| !runs_before.contains(id)))
+        .collect();
+    let Some(run) = runs.first() else { return LinkState::Pending };
+    let run_id = run["id"].as_str().unwrap_or_default();
+    // A reply means the model ran: decided as soon as one appears, so the run can be stopped.
+    let replied =
+        p["messages"].as_array().into_iter().flatten().any(|m| m["runId"] == run_id && m["role"] == "assistant");
+    if replied || run["status"] == "completed" {
+        return LinkState::Resumed(run_id.to_string());
+    }
+    if active_run(p) {
+        LinkState::Pending
+    } else if has_provider_turn(p) {
+        LinkState::Linked
+    } else {
+        LinkState::Failed(anyhow!(
+            "the first turn ended without reaching Claude Code (is the claude CLI installed for T3?)"
+        ))
+    }
+}
+
+/// Sends the link turns and waits for them to settle. The first goes alone, and the rest
+/// only once one has linked: on a T3 that resumes on the first turn, the note reaches the
+/// model, and that should happen to one session at most. Returns the number of failures.
+fn link_all(t3: &mut t3::T3, jobs: Vec<LinkJob>) -> usize {
+    let mut queue: std::collections::VecDeque<LinkJob> = jobs.into();
+    let mut in_flight: Vec<(LinkJob, Instant)> = Vec::new();
+    let (mut failed, mut proven, mut stop) = (0, false, None::<String>);
+    loop {
+        while stop.is_none() && in_flight.len() < if proven { PARALLEL_LINKS } else { 1 } {
+            let Some(job) = queue.pop_front() else { break };
+            match job.dispatch(t3) {
+                Ok(()) => in_flight.push((job, Instant::now())),
+                Err(e) => {
+                    failed += 1;
+                    println!("  ! link {} failed: {e:#}", short(&job.native_id));
+                    settle(t3, &job);
+                }
+            }
+        }
+        if in_flight.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let mut i = 0;
+        while i < in_flight.len() {
+            let (job, started) = &in_flight[i];
+            let state = match job.poll(t3) {
+                LinkState::Pending if started.elapsed() > LINK_TIMEOUT => LinkState::TimedOut,
+                state => state,
+            };
+            let short_id = short(&job.native_id).to_string();
+            match state {
+                LinkState::Pending => {
+                    i += 1;
+                    continue;
+                }
+                LinkState::Linked => {
+                    proven = true;
+                    println!("  linked {short_id}: the next message resumes the session");
+                }
+                LinkState::Resumed(run_id) => {
+                    println!("  T3 resumed session {short_id} on its first turn, so this T3 needs no linking");
+                    let interrupt = json!({
+                        "type": "run.interrupt",
+                        "commandId": stable_id("thread.link.interrupt", &run_id),
+                        "threadId": job.thread_id,
+                        "runId": run_id,
+                    });
+                    if let Err(e) = t3.dispatch(interrupt) {
+                        println!("    ! stopping that turn failed: {e:#}");
+                    }
+                    stop.get_or_insert_with(|| "this T3 resumes on the first turn".into());
+                }
+                LinkState::Failed(e) => {
+                    failed += 1;
+                    println!("  ! link {short_id} failed: {e:#}");
+                }
+                LinkState::TimedOut => {
+                    failed += 1;
+                    println!("  ! link {short_id} failed: timed out waiting for the first turn to finish");
+                    // Until one link works, a turn that runs this long may be one that reached the model.
+                    if !proven {
+                        stop.get_or_insert_with(|| "no link could be confirmed".into());
+                    }
+                }
+            }
+            let (job, _) = in_flight.swap_remove(i);
+            settle(t3, &job);
+        }
+    }
+    if let Some(reason) = stop {
+        if !queue.is_empty() {
+            println!("  not linking {} other thread(s): {reason}", queue.len());
+        }
+        for job in queue {
+            settle(t3, &job);
+        }
+    }
+    failed
+}
+
+fn settle(t3: &mut t3::T3, job: &LinkJob) {
+    if job.archive {
+        archive(t3, &job.thread_id, &job.thread_key);
+    }
+}
+
 /// Where Claude Code keeps a session: `projects/<cwd with every non-alphanumeric character
-/// replaced by '-'>/<id>.jsonl`. Claude Code shortens directory names over 200 characters
-/// with a hash suffix, so those are matched on the 200-character prefix.
+/// replaced by '-'>/<id>.jsonl`. Claude Code replaces per UTF-16 code unit, so a character
+/// outside the BMP becomes two dashes. It shortens directory names over 200 characters with
+/// a hash suffix, so those are matched on the 200-character prefix.
 fn claude_transcript(claude_home: &Path, cwd: &str, native_id: &str) -> PathBuf {
     let projects = claude_home.join("projects");
-    let dir: String = cwd.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    let dir: String = cwd
+        .encode_utf16()
+        .map(|u| char::from_u32(u.into()).filter(char::is_ascii_alphanumeric).unwrap_or('-'))
+        .collect();
     let file = format!("{native_id}.jsonl");
     if dir.len() <= 200 {
         return projects.join(dir).join(file);
@@ -545,6 +676,10 @@ fn has_provider_turn(projection: &Value) -> bool {
     projection["providerTurns"].as_array().is_some_and(|t| !t.is_empty())
 }
 
+fn run_ids(projection: &Value) -> impl Iterator<Item = &str> {
+    projection["runs"].as_array().into_iter().flatten().filter_map(|r| r["id"].as_str())
+}
+
 fn active_run(projection: &Value) -> bool {
     projection["runs"]
         .as_array()
@@ -553,36 +688,50 @@ fn active_run(projection: &Value) -> bool {
         .any(|r| matches!(r["status"].as_str(), Some("preparing" | "queued" | "starting" | "running" | "waiting")))
 }
 
-/// T3 titles a thread from its first message when the thread has no messages, which every
-/// unlinked imported thread qualifies for. Put the imported title back on threads where no
-/// turn has completed yet, i.e. where the current title can only have come from that.
+/// T3 titles a thread from the first message it is sent while the thread has no messages,
+/// which happens to an imported Claude thread whose first message came from the user before
+/// it was linked. Put the imported title back there, as long as no turn has completed.
 ///
 /// The title to restore is the one the thread was created with, which T3 keeps in the
 /// provider thread's native metadata. It is not recomputed from the current sources: a
 /// session found through both Paseo and Claude Code has a different title in each.
 fn restore_title(t3: &mut t3::T3, projection: &Value, thread_key: &str) -> Result<()> {
-    let Some(title) = title_to_restore(projection) else { return Ok(()) };
+    let Some((title, retitled_by)) = title_to_restore(projection) else { return Ok(()) };
     let current = projection["thread"]["title"].as_str().unwrap_or("");
+    // Keyed by the message that caused the retitle, so it is undone once and a later rename
+    // by the user is left alone: T3 answers a repeated commandId without running it.
     t3.dispatch(json!({
         "type": "thread.metadata.update",
-        "commandId": stable_id("thread.title.restore", &format!("{thread_key}\0{current}")),
+        "commandId": stable_id("thread.title.restore", &format!("{thread_key}\0{retitled_by}")),
         "threadId": projection["thread"]["id"],
         "title": title,
     }))?;
-    println!("    title restored from \"{current}\"");
+    let after = t3.rpc("orchestration.getThreadProjection", json!({ "threadId": projection["thread"]["id"] }))?;
+    if after["thread"]["title"] == title {
+        println!("    title restored from \"{current}\"");
+    }
     Ok(())
 }
 
-fn title_to_restore(projection: &Value) -> Option<&str> {
+/// The imported title and the id of the message T3 retitled the thread from.
+fn title_to_restore(projection: &Value) -> Option<(&str, &str)> {
     let current = projection["thread"]["title"].as_str().unwrap_or("");
     let imported = projection["providerThreads"]
         .as_array()
         .into_iter()
         .flatten()
         .find_map(|p| p["nativeMetadata"]["title"].as_str().filter(|t| !t.trim().is_empty()))?;
-    let runs = projection["runs"].as_array()?;
-    let completed = runs.iter().any(|r| r["status"] == "completed");
-    (current != imported && !runs.is_empty() && !completed).then_some(imported)
+    // The first message sent through T3; backfilled history (see t3-history) is not.
+    let first = projection["messages"]
+        .as_array()?
+        .iter()
+        .filter(|m| m["role"] == "user" && m["id"].as_str().is_some_and(|id| !id.contains(":paseo2t3:")))
+        .min_by_key(|m| m["createdAt"].as_str().unwrap_or(""))?;
+    if first["text"].as_str().is_none_or(|t| t.starts_with(LINK_NOTE_PREFIX)) {
+        return None;
+    }
+    let completed = projection["runs"].as_array()?.iter().any(|r| r["status"] == "completed");
+    (current != imported && !completed).then_some((imported, first["id"].as_str()?))
 }
 
 #[cfg(test)]
@@ -651,25 +800,65 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("abc.jsonl"), "").unwrap();
         assert_eq!(claude_transcript(&home, &long, "abc"), dir.join("abc.jsonl"));
+        // Claude Code replaces UTF-16 code units, so an emoji takes two dashes.
+        assert_eq!(
+            claude_transcript(&home, "/w/proj-\u{1F680}", "abc"),
+            home.join("projects").join("-w-proj---").join("abc.jsonl")
+        );
         std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]
-    fn titles_are_restored_to_the_imported_title_only_before_any_turn_completes() {
-        let projection = |title: &str, runs: &[&str]| {
+    fn titles_are_restored_only_after_a_retitle_by_the_users_first_message() {
+        let projection = |title: &str, first: &str, runs: &[&str]| {
             json!({
                 "thread": { "title": title },
                 "providerThreads": [{ "nativeMetadata": { "title": "From Paseo" } }],
+                "messages": [
+                    { "id": "t:paseo2t3:000000", "role": "user", "text": "old history", "createdAt": "2026-01-01T00:00:00Z" },
+                    { "id": "m2", "role": "user", "text": "later", "createdAt": "2026-10-31T00:00:02Z" },
+                    { "id": "m1", "role": "user", "text": first, "createdAt": "2026-10-31T00:00:01Z" },
+                ],
                 "runs": runs.iter().map(|s| json!({ "status": s })).collect::<Vec<_>>(),
             })
         };
-        assert_eq!(title_to_restore(&projection("Resume previous session", &["failed"])), Some("From Paseo"));
-        assert_eq!(title_to_restore(&projection("From Paseo", &["failed"])), None);
-        assert_eq!(title_to_restore(&projection("Renamed by hand", &[])), None);
-        assert_eq!(title_to_restore(&projection("Retitled later", &["failed", "completed"])), None);
-        let mut no_metadata = projection("Resume previous session", &["failed"]);
+        assert_eq!(
+            title_to_restore(&projection("Resume previous session", "Resume previous session", &["failed"])),
+            Some(("From Paseo", "m1"))
+        );
+        assert_eq!(title_to_restore(&projection("From Paseo", "hi", &["failed"])), None);
+        // After the link note T3 never retitles, so a different title is the user's.
+        assert_eq!(title_to_restore(&projection("Renamed by hand", &link_note("x"), &["failed"])), None);
+        assert_eq!(title_to_restore(&projection("Retitled later", "hi", &["failed", "completed"])), None);
+        let mut no_messages = projection("Renamed by hand", "hi", &[]);
+        no_messages["messages"] = json!([]);
+        assert_eq!(title_to_restore(&no_messages), None);
+        let mut no_metadata = projection("Resume previous session", "hi", &["failed"]);
         no_metadata["providerThreads"] = json!([{ "nativeMetadata": null }]);
         assert_eq!(title_to_restore(&no_metadata), None);
+    }
+
+    #[test]
+    fn link_turns_are_judged_by_the_run_they_started() {
+        let before: HashSet<String> = ["r0".to_string()].into();
+        let state = |runs: Value, turns: usize, messages: Value| {
+            let p = json!({ "runs": runs, "providerTurns": vec![json!({}); turns], "messages": messages });
+            match link_state(&p, &before) {
+                LinkState::Pending => "pending",
+                LinkState::Linked => "linked",
+                LinkState::Resumed(_) => "resumed",
+                LinkState::Failed(_) => "failed",
+                LinkState::TimedOut => "timed out",
+            }
+        };
+        let old = json!({ "id": "r0", "status": "failed" });
+        assert_eq!(state(json!([old]), 0, json!([])), "pending");
+        assert_eq!(state(json!([old, { "id": "r1", "status": "starting" }]), 0, json!([])), "pending");
+        assert_eq!(state(json!([old, { "id": "r1", "status": "failed" }]), 1, json!([])), "linked");
+        assert_eq!(state(json!([old, { "id": "r1", "status": "failed" }]), 0, json!([])), "failed");
+        assert_eq!(state(json!([old, { "id": "r1", "status": "completed" }]), 1, json!([])), "resumed");
+        let reply = json!([{ "runId": "r1", "role": "assistant" }]);
+        assert_eq!(state(json!([old, { "id": "r1", "status": "running" }]), 1, reply), "resumed");
     }
 
     #[test]

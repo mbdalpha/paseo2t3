@@ -23,7 +23,7 @@ Built against Paseo 0.11.3 and T3 Code 0.1.5.
 | title, model                   | thread title, model selection                 |
 | worktree workspace + branch    | thread `worktreePath` + `branch`              |
 | archived agent                 | archived thread (with `--include-archived`)   |
-| archived sub-agent of a live agent | archived thread, always                   |
+| archived sub-agent of an imported live agent | archived thread, always         |
 | conversation so far            | thread messages (`t3-history/backfill.ts`)    |
 | sub-agent (`paseo.parent-agent-id`) | thread nested under its parent (`t3-history/backfill.ts`) |
 
@@ -43,8 +43,11 @@ upstream as [t3code#15243](https://github.com/pingdotgg/t3code/issues/15243), wi
 A thread is linked only when its transcript is where Claude Code looks it up
 (`<claude home>/projects/<cwd with non-alphanumerics as '-'>/<id>.jsonl`); otherwise the
 first turn would start a new session and reach the model, so the import prints
-`not linked` instead. If T3 ever resumes on the first turn, the import notices, says so and
-stops linking. `--no-link` turns linking off.
+`not linked` instead. The first link turn runs alone, and the rest run eight at a time once
+one has linked. If T3 resumes on the first turn instead, the note reaches the model in that
+one session: the import stops that turn as soon as a reply appears, says so and links
+nothing else. It also stops if the first link turn times out, since that may be the same
+case. `--no-link` turns linking off.
 
 Not carried over: Paseo's in-memory timeline (Paseo never stores one), schedules, voice
 settings. `import` alone leaves threads **empty in T3's UI** (the provider still has the full
@@ -81,8 +84,10 @@ paseo2t3 import --t3-home ~/.t3 --token-file /tmp/t3-token --apply
   and the `orchestration.dispatchCommand` WebSocket RPC), never its database.
 - Re-running is safe: ids are derived from `(provider, native session id)`, existing threads
   are reported as already present, and T3 deduplicates repeated commands. A re-run also
-  links existing Claude threads that have no provider turn yet, and puts back the imported
-  title on threads T3 retitled from a first message that failed (no turn completed).
+  links existing Claude threads that have no provider turn yet (a failed link is retried),
+  and puts back the imported title on a thread T3 retitled from the user's first message
+  when no turn has completed. That restore happens once per thread, so a later rename by
+  hand stays.
 - `--map FROM=TO` rewrites path prefixes when sessions were recorded under another home.
 - Project roots must exist on the machine running the import (`--no-path-check` to skip).
 - Claude sessions are placed at their exact original cwd, because Claude Code looks a
@@ -96,7 +101,9 @@ session importer, which does write history, skips any session another thread alr
 projection code and transcript parser, so the result is what T3's importer would write:
 
 - each thread gets the user and assistant messages of its Claude Code or Codex transcript
-  (the first message plus the latest 199), ahead of anything sent in T3;
+  (the first message plus the latest 199), ahead of anything sent in T3. The transcript is
+  read only up to the thread's first T3 message, because Claude Code appends turns sent
+  from T3 to the same transcript and T3 already shows those;
 - each Paseo sub-agent's thread becomes a sub-agent of its parent's thread, so it shows
   under the parent (T3's relationships menu) instead of in the sidebar. It is still a normal
   thread you can open and message.
@@ -121,7 +128,8 @@ node paseo2t3-backfill.ts --db ~/.t3/userdata/statev2.sqlite --scan /path/to/sca
 - Re-running is safe: event ids are derived from the thread, and threads already done are
   skipped.
 - Transcripts are streamed and reduced to the fields T3's parser reads, so multi-hundred-MB
-  Codex rollouts are fine.
+  Codex rollouts are fine. A transcript that can't be read is reported as `failed` and
+  skipped; the other threads are still done, and the exit code is 1.
 
 ## Testing
 
@@ -139,7 +147,8 @@ titles, project count), then re-imports to prove nothing is duplicated. It never
 `~/.t3`: the T3 runtime is cached in `e2e/.cache` (override with `T3_RUNTIME_HOME`). T3 runs
 Claude threads through `e2e/fake-claude.mjs`, which logs its arguments and fails every turn, so
 the run checks that the link turn asks for `--session-id`, that the next message asks for
-`--resume`, and that a re-import restores a title T3 replaced. With `T3_SRC` (a prepared T3
-source checkout) and `T3_NODE` (Node 26) set, it also runs the history backfill against the
-running server and checks the messages and the sub-agent nesting. It needs Node 22.13+ and
+`--resume`, that a re-import restores a title T3 replaced, and that a later re-import keeps
+a manual rename. With `T3_SRC` (a prepared T3 source checkout) and `T3_NODE` (Node 26) set,
+it also runs the history backfill against the running server and checks the messages
+(without the turn continued in T3) and the sub-agent nesting. It needs Node 22.13+ and
 git, and makes no model calls.
