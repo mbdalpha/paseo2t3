@@ -28,6 +28,18 @@ const worktree = p("repos", "demo-wt-feature");
 const plain = p("plain");
 const t3Data = p("t3data");
 const tokenFile = p("token.txt");
+const fakeClaude = p("bin", "claude.mjs");
+const fakeClaudeLog = p("bin", "fake-claude.log");
+// The Claude SDK passes some flags as `--flag=value` and others as two arguments.
+const argAfter = (args, flag) => {
+  const i = args.indexOf(flag);
+  if (i >= 0) return args[i + 1];
+  return args.find((a) => a.startsWith(`${flag}=`))?.slice(flag.length + 1);
+};
+// Turns the stub ran for imported sessions (title generation also calls claude; skip those).
+const claudeCalls = () =>
+  (fs.existsSync(fakeClaudeLog) ? fs.readFileSync(fakeClaudeLog, "utf8").trim().split("\n").map((l) => JSON.parse(l)) : [])
+    .filter((args) => [IDS.claudeNative, IDS.claudeViaPaseo].includes(argAfter(args, "--session-id") ?? argAfter(args, "--resume")));
 
 const log = (...args) => console.log("[e2e]", ...args);
 const env = { ...process.env, T3CODE_HOME: runtimeHome };
@@ -55,6 +67,28 @@ async function freePort() {
       srv.close(() => resolve(port));
     });
     srv.on("error", reject);
+  });
+}
+
+// One Effect-RPC call over T3's WebSocket, the way the web client sends commands.
+async function rpc(origin, token, method, payload) {
+  // A keep-alive socket the server already closed fails once with UND_ERR_SOCKET; retry.
+  const getTicket = () => fetch(`${origin}/api/auth/websocket-ticket/rpc`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+  const { ticket } = await (await getTicket().catch(getTicket)).json();
+  const ws = new WebSocket(`${origin.replace(/^http/, "ws")}/ws?orchestrationProtocol=2&wsTicket=${ticket}`);
+  return new Promise((resolve, reject) => {
+    ws.onerror = reject;
+    ws.onopen = () => ws.send(JSON.stringify({ _tag: "Request", id: "1", tag: method, payload, headers: [] }));
+    ws.onmessage = (e) => {
+      for (const m of [JSON.parse(e.data)].flat()) {
+        if (m._tag === "Ping") ws.send(JSON.stringify({ _tag: "Pong" }));
+        if (m._tag === "Exit" || m._tag === "Defect") {
+          ws.close();
+          if (m._tag === "Exit" && m.exit._tag === "Success") resolve(m.exit.value);
+          else reject(new Error(`${method}: ${JSON.stringify(m)}`));
+        }
+      }
+    };
   });
 }
 
@@ -98,6 +132,15 @@ try {
   assert.equal(wt.branch, "feature/x");
   log("scan ok");
 
+  // T3 runs Claude threads through a stub, so linking is checked without model calls.
+  fs.mkdirSync(path.dirname(fakeClaude), { recursive: true });
+  fs.copyFileSync(path.join(here, "fake-claude.mjs"), fakeClaude);
+  fs.mkdirSync(path.join(t3Data, "userdata"), { recursive: true });
+  fs.writeFileSync(
+    path.join(t3Data, "userdata", "settings.json"),
+    JSON.stringify({ providerInstances: { claudeAgent: { driver: "claudeAgent", config: { binaryPath: fakeClaude } } } }),
+  );
+
   const port = await freePort();
   log(`starting t3 serve on ${port} (first run downloads the runtime)`);
   const server = spawn(process.execPath, [t3Launcher, "serve", "--base-dir", t3Data, "--host", "127.0.0.1", "--port", String(port)], { env, stdio: ["ignore", "pipe", "pipe"] });
@@ -125,6 +168,14 @@ try {
   const first = tool("import", ...common, ...target, "--apply");
   assert.match(first, /Done: 6 imported, 0 already present, 0 failure/, first);
   assert.match(first, /does not exist here/, "missing project root is reported");
+  // The native Claude session has a transcript in the Claude home, so its thread is linked:
+  // one throwaway turn that asks for a new session under the id and is refused.
+  assert.match(first, new RegExp(`linked: the next message resumes session ${IDS.claudeNative.slice(0, 8)}`), first);
+  // The Paseo Claude agent has no transcript there, so a first turn would start a new session.
+  assert.match(first, /not linked: no transcript at/, first);
+  const linkCalls = claudeCalls();
+  assert.equal(linkCalls.length, 1, `one link turn: ${JSON.stringify(linkCalls)}`);
+  assert.equal(argAfter(linkCalls[0], "--session-id"), IDS.claudeNative);
   log("import ok");
 
   const db = new DatabaseSync(path.join(t3Data, "userdata", "statev2.sqlite"), { readOnly: true });
@@ -153,8 +204,37 @@ try {
   db.close();
   log("persisted state ok");
 
+  // After linking, the user's first message resumes the original session.
+  const token = fs.readFileSync(tokenFile, "utf8").trim();
+  const linked = refs.get(IDS.claudeNative).threadId;
+  try {
+    t3("thread", "send", linked, "continue", "--base-dir", t3Data, "--wait");
+  } catch {} // the stub fails every turn; only its arguments matter here
+  const sendCall = claudeCalls()[1];
+  assert.ok(sendCall, "the first message reached claude");
+  assert.equal(argAfter(sendCall, "--resume"), IDS.claudeNative, `first message resumes: ${JSON.stringify(sendCall)}`);
+  assert.equal(argAfter(sendCall, "--session-id"), undefined);
+  log("first message resumes the linked session");
+
+  // An unlinked thread's first web message fails and T3 retitles the thread from it.
+  const unlinked = refs.get(IDS.claudeViaPaseo).threadId;
+  await rpc(origin, token, "orchestration.dispatchCommand", {
+    type: "message.dispatch", commandId: crypto.randomUUID(), threadId: unlinked, messageId: crypto.randomUUID(),
+    text: "resume", attachments: [], titleSeed: "resume", createdBy: "user", creationSource: "web",
+    dispatchMode: { type: "start_immediately" },
+  });
+  const showTitle = (id) => JSON.parse(t3("thread", "show", id, "--base-dir", t3Data, "--json")).thread;
+  await waitFor("the failed first turn", async () => {
+    const t = showTitle(unlinked);
+    return t.title !== "Claude via Paseo" && claudeCalls().length === 3;
+  });
+  log(`unlinked thread retitled to "${showTitle(unlinked).title}"`);
+
   const second = tool("import", ...common, ...target, "--apply");
   assert.match(second, /Done: 0 imported, 6 already present, 0 failure/, second);
+  assert.match(second, /title restored from/, second);
+  assert.equal(showTitle(unlinked).title, "Claude via Paseo", "re-import restores the imported title");
+  assert.equal(claudeCalls().length, 3, "re-import starts no turns");
   const db2 = new DatabaseSync(path.join(t3Data, "userdata", "statev2.sqlite"), { readOnly: true });
   assert.equal(db2.prepare("SELECT count(*) AS n FROM orchestration_v2_projection_threads").get().n, 6, "no duplicate threads");
   db2.close();
