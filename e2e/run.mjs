@@ -136,6 +136,9 @@ try {
   const withoutArchived = JSON.parse(tool("scan", ...common.filter((a) => a !== "--include-archived"), "--json"));
   const kept = withoutArchived.sessions.map((s) => s.native_id);
   assert.ok(kept.includes(IDS.codexArchived), "an archived sub-agent of a live agent is kept");
+  // ...but not when a filter drops that agent: its thread would not exist to nest under.
+  const parentFiltered = JSON.parse(tool("scan", ...common.filter((a) => a !== "--include-archived"), "--cwd-prefix", demo, "--json"));
+  assert.ok(!parentFiltered.sessions.some((s) => s.native_id === IDS.codexArchived), "archived sub-agent of a filtered-out agent is skipped");
   log("scan ok");
 
   // T3 runs Claude threads through a stub, so linking is checked without model calls.
@@ -176,7 +179,7 @@ try {
   assert.match(first, /does not exist here/, "missing project root is reported");
   // The native Claude session has a transcript in the Claude home, so its thread is linked:
   // one throwaway turn that asks for a new session under the id and is refused.
-  assert.match(first, new RegExp(`linked: the next message resumes session ${IDS.claudeNative.slice(0, 8)}`), first);
+  assert.match(first, new RegExp(`linked ${IDS.claudeNative.slice(0, 8)}: the next message resumes the session`), first);
   // The Paseo Claude agent has no transcript there, so a first turn would start a new session.
   assert.match(first, /not linked: no transcript at/, first);
   const linkCalls = claudeCalls();
@@ -246,6 +249,15 @@ try {
   db2.close();
   log("idempotent re-run ok");
 
+  // A rename after the restore is the user's, and a later import keeps it.
+  await rpc(origin, token, "orchestration.dispatchCommand", {
+    type: "thread.metadata.update", commandId: crypto.randomUUID(), threadId: unlinked, title: "Renamed by hand",
+  });
+  const third = tool("import", ...common, ...target, "--apply");
+  assert.doesNotMatch(third, /title restored from/, third);
+  assert.equal(showTitle(unlinked).title, "Renamed by hand", "re-import keeps a manual rename");
+  log("manual rename kept");
+
   if (process.env.T3_SRC) {
     const scanFile = p("scan.json");
     fs.writeFileSync(scanFile, tool("scan", ...common, "--json"));
@@ -255,8 +267,17 @@ try {
       const out = execFileSync(process.env.T3_NODE || process.execPath, [script, "--db", path.join(t3Data, "userdata", "statev2.sqlite"), "--scan", scanFile, "--claude-home", p("claude"), "--codex-home", p("codex"), ...extra], { cwd: path.dirname(script), encoding: "utf8" });
       return JSON.parse(out.slice(out.indexOf("{")));
     };
+    // The session continued in T3 after linking: Claude Code appended that turn to the
+    // transcript, and T3 already shows it, so it is not backfilled a second time.
+    const transcript = path.join(p("claude"), "projects", demo.replace(/[^a-zA-Z0-9]/g, "-"), `${IDS.claudeNative}.jsonl`);
+    const later = { sessionId: IDS.claudeNative, cwd: demo, isSidechain: false, timestamp: new Date().toISOString() };
+    fs.appendFileSync(transcript, [
+      { type: "user", ...later, message: { role: "user", content: "Continued in T3" } },
+      { type: "assistant", ...later, message: { role: "assistant", model: "claude-haiku-5-5", content: [{ type: "text", text: "Reply in T3" }] } },
+    ].map((r) => JSON.stringify(r) + "\n").join(""));
     try {
       const applied = backfill("--apply");
+      assert.equal(applied.messages, 3, `the two original Claude messages and one Codex message: ${JSON.stringify(applied)}`);
       assert.equal(applied.history, 2, `history for the native Claude and Codex sessions: ${JSON.stringify(applied)}`);
       assert.equal(applied.nested, 2, `both sub-agents nested: ${JSON.stringify(applied)}`);
       assert.equal(backfill().threads, 0, "a second backfill has nothing to do");

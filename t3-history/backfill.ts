@@ -19,7 +19,7 @@ import readline from "node:readline";
 import util from "node:util";
 import { parseArgs } from "node:util";
 
-import { EventId, MessageId, ThreadId, TurnItemId } from "@t3tools/contracts";
+import { EventId, MessageId, ProviderInstanceId, ThreadId, TurnItemId } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -101,8 +101,10 @@ const textOnly = (content: any) => (Array.isArray(content) ? content.filter(isTe
 /**
  * The transcript reduced to the records and fields T3's parser reads. Rollouts with
  * screenshots and tool output reach hundreds of MB, more than one string can hold.
+ * Messages from `cutoffMs` on are dropped: the session was continued in T3 by then, and
+ * T3 already shows those turns.
  */
-async function slimTranscript(file: string, source: string): Promise<string> {
+async function slimTranscript(file: string, source: string, cutoffMs: number): Promise<string> {
   const out: string[] = [];
   const lines = readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
   for await (const line of lines) {
@@ -113,6 +115,7 @@ async function slimTranscript(file: string, source: string): Promise<string> {
     } catch {
       continue;
     }
+    if (typeof r.timestamp === "string" && Date.parse(r.timestamp) >= cutoffMs) continue;
     if (source === "claudeAgent") {
       if (r.type === "user" || r.type === "assistant") {
         const { type, isSidechain, isMeta, isCompactSummary, timestamp, sessionId, cwd } = r;
@@ -167,7 +170,7 @@ const program = Effect.gen(function* () {
     return threadIdOf(top);
   };
 
-  const totals = { threads: 0, history: 0, messages: 0, nested: 0, noTranscript: 0, unparsable: 0, missing: 0 };
+  const totals = { threads: 0, history: 0, messages: 0, nested: 0, noTranscript: 0, unparsable: 0, failed: 0, missing: 0 };
   for (const s of sessions) {
     const threadId = ThreadId.make(threadIdOf(s));
     if (!live(threadId)) {
@@ -182,18 +185,25 @@ const program = Effect.gen(function* () {
     const file = done.length > 0 ? null : transcriptOf(s);
     if (done.length === 0 && file === null) totals.noTranscript += 1;
     if (file !== null) {
-      const parsed = parseAgentSessionTranscript({
-        source: s.driver as "claudeAgent" | "codex",
-        providerInstanceId: thread.providerInstanceId,
-        fallbackSessionId: s.native_id,
-        lastActiveAtMs: fs.statSync(file).mtimeMs,
-        contents: yield* Effect.promise(() => slimTranscript(file, s.driver)),
-      });
-      if (parsed === null) totals.unparsable += 1;
+      // Where the thread's own T3 history starts.
+      const [first] = yield* sql<{ at: string | null }>`
+        SELECT min(at) AS at FROM (
+          SELECT min(created_at) AS at FROM orchestration_v2_projection_messages
+          WHERE thread_id = ${threadId} AND message_id NOT LIKE ${`${threadId}:paseo2t3:%`}
+          UNION ALL
+          SELECT min(requested_at) FROM orchestration_v2_projection_runs WHERE thread_id = ${threadId}
+        )
+      `;
+      const cutoffMs = first?.at ? Date.parse(first.at) : Infinity;
+      const history = yield* Effect.promise(() => readHistory(threadId, s, thread.providerInstanceId, file, cutoffMs));
+      if (history.kind === "failed") {
+        totals.failed += 1;
+        console.error(`! ${threadId} ${file}: ${history.error}`);
+      } else if (history.kind === "unparsable") totals.unparsable += 1;
       else {
-        parsed.messages.forEach((message, index) => events.push(...messageEvents(threadId, index, message)));
-        if (parsed.messages.length > 0) totals.history += 1;
-        totals.messages += parsed.messages.length;
+        events.push(...history.events);
+        if (history.messages > 0) totals.history += 1;
+        totals.messages += history.messages;
       }
     }
 
@@ -246,7 +256,26 @@ const program = Effect.gen(function* () {
     );
   }
   console.log(JSON.stringify({ apply: args.apply, ...totals }, null, 2));
+  if (totals.failed > 0) process.exitCode = 1;
 });
+
+/** One thread's history as events. Never rejects, so one bad transcript skips one thread. */
+async function readHistory(threadId: ThreadId, s: ScanSession, providerInstanceId: ProviderInstanceId, file: string, cutoffMs: number) {
+  try {
+    const parsed = parseAgentSessionTranscript({
+      source: s.driver as "claudeAgent" | "codex",
+      providerInstanceId,
+      fallbackSessionId: s.native_id,
+      lastActiveAtMs: Math.min(fs.statSync(file).mtimeMs, cutoffMs),
+      contents: await slimTranscript(file, s.driver, cutoffMs),
+    });
+    if (parsed === null) return { kind: "unparsable" } as const;
+    const events = parsed.messages.flatMap((message, index) => messageEvents(threadId, index, message));
+    return { kind: "events", events, messages: parsed.messages.length } as const;
+  } catch (error) {
+    return { kind: "failed", error } as const;
+  }
+}
 
 /** SQLITE_BUSY, however deep T3's error types wrap it. */
 const isLocked = (e: unknown) => util.inspect(e, { depth: 12 }).includes("database is locked");
