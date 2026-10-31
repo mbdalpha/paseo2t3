@@ -24,14 +24,24 @@ Built against Paseo 0.11.3 and T3 Code 0.1.5.
 | worktree workspace + branch    | thread `worktreePath` + `branch`              |
 | archived agent                 | archived thread (with `--include-archived`)   |
 
-**Known T3 quirk (0.1.5 and main as of 2026-10-30):** the first message in an imported
-Claude thread fails with "Provider turn failed". The Claude adapter only passes `resume` once
-the thread has a recorded provider turn, so the first open asks Claude Code to create a new
-session under the existing id, which it refuses. That failed attempt records a turn; send the
-message again and the thread resumes the original session with full history (verified with a
-codeword planted in a throwaway session). Codex threads are not affected by this check.
-Tracked upstream as [t3code#15243](https://github.com/pingdotgg/t3code/issues/15243), with a fix
-in [t3code#23219](https://github.com/pingdotgg/t3code/pull/23219).
+**Claude threads are linked on import.** T3 Code (0.1.5 and main as of 2026-10-31) passes
+`resume` to Claude Code only once a thread has a recorded provider turn. Left alone, the first
+message in an imported Claude thread asks Claude Code to create a new session under the
+existing id, which it refuses, so the message fails with "Provider turn failed". Because the
+thread has no messages yet, T3 also retitles it from that message, so it loses its Paseo title.
+To avoid both, the import sends each Claude thread one short `[paseo2t3]` note and waits for
+that turn to fail. The failure records a provider turn, and the user's first message then
+resumes the original session with full history (verified with a codeword planted in a
+throwaway session). Claude Code rejects the note before any model call; T3 passes it to the
+next turn as earlier context. Codex threads are not affected and are not linked. Tracked
+upstream as [t3code#15243](https://github.com/pingdotgg/t3code/issues/15243), with a fix in
+[t3code#23219](https://github.com/pingdotgg/t3code/pull/23219).
+
+A thread is linked only when its transcript is where Claude Code looks it up
+(`<claude home>/projects/<cwd with non-alphanumerics as '-'>/<id>.jsonl`); otherwise the
+first turn would start a new session and reach the model, so the import prints
+`not linked` instead. If T3 ever resumes on the first turn, the import notices, says so and
+stops linking. `--no-link` turns linking off.
 
 Not carried over: Paseo's in-memory timeline (Paseo never stores one), schedules, voice
 settings. Imported threads open **empty in T3's UI**: the history stays with the provider,
@@ -66,7 +76,9 @@ paseo2t3 import --t3-home ~/.t3 --token-file /tmp/t3-token --apply
 - The T3 server must be running; the tool only uses its public API (`/api/projects/mutate`
   and the `orchestration.dispatchCommand` WebSocket RPC), never its database.
 - Re-running is safe: ids are derived from `(provider, native session id)`, existing threads
-  are reported as already present, and T3 deduplicates repeated commands.
+  are reported as already present, and T3 deduplicates repeated commands. A re-run also
+  links existing Claude threads that have no provider turn yet, and puts back the imported
+  title on threads T3 retitled from a first message that failed (no turn completed).
 - `--map FROM=TO` rewrites path prefixes when sessions were recorded under another home.
 - Project roots must exist on the machine running the import (`--no-path-check` to skip).
 - Claude sessions are placed at their exact original cwd, because Claude Code looks a
@@ -85,5 +97,8 @@ layout, unsupported provider, never-started, internal, corrupt file, missing dir
 sub-agent thread), starts `t3 serve` on a temporary data directory and a free port, imports
 everything, checks what T3 persisted (native session refs, archive state, worktree and branch,
 titles, project count), then re-imports to prove nothing is duplicated. It never touches
-`~/.t3`: the T3 runtime is cached in `e2e/.cache` (override with `T3_RUNTIME_HOME`). It needs
-Node 22.13+ and git, and makes no model calls.
+`~/.t3`: the T3 runtime is cached in `e2e/.cache` (override with `T3_RUNTIME_HOME`). T3 runs
+Claude threads through `e2e/fake-claude.mjs`, which logs its arguments and fails every turn, so
+the run checks that the link turn asks for `--session-id`, that the next message asks for
+`--resume`, and that a re-import restores a title T3 replaced. It needs Node 22.13+ and git,
+and makes no model calls.
