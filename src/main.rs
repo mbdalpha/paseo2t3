@@ -336,7 +336,7 @@ fn import(sessions: &[Session], target: &TargetArgs, runtime_mode: &str, claude_
             if !thread["deletedAt"].is_null() {
                 continue;
             }
-            if let Err(e) = restore_title(&mut t3, &projection, &thread_key, &title) {
+            if let Err(e) = restore_title(&mut t3, &projection, &thread_key) {
                 println!("    ! title restore failed: {e:#}");
             }
             if link && s.driver == "claudeAgent" && thread["archivedAt"].is_null() {
@@ -545,12 +545,13 @@ fn active_run(projection: &Value) -> bool {
 /// T3 titles a thread from its first message when the thread has no messages, which every
 /// unlinked imported thread qualifies for. Put the imported title back on threads where no
 /// turn has completed yet, i.e. where the current title can only have come from that.
-fn restore_title(t3: &mut t3::T3, projection: &Value, thread_key: &str, title: &str) -> Result<()> {
+///
+/// The title to restore is the one the thread was created with, which T3 keeps in the
+/// provider thread's native metadata. It is not recomputed from the current sources: a
+/// session found through both Paseo and Claude Code has a different title in each.
+fn restore_title(t3: &mut t3::T3, projection: &Value, thread_key: &str) -> Result<()> {
+    let Some(title) = title_to_restore(projection) else { return Ok(()) };
     let current = projection["thread"]["title"].as_str().unwrap_or("");
-    let completed = projection["runs"].as_array().into_iter().flatten().any(|r| r["status"] == "completed");
-    if current == title || completed || projection["runs"].as_array().is_none_or(|r| r.is_empty()) {
-        return Ok(());
-    }
     t3.dispatch(json!({
         "type": "thread.metadata.update",
         "commandId": stable_id("thread.title.restore", &format!("{thread_key}\0{current}")),
@@ -559,6 +560,18 @@ fn restore_title(t3: &mut t3::T3, projection: &Value, thread_key: &str, title: &
     }))?;
     println!("    title restored from \"{current}\"");
     Ok(())
+}
+
+fn title_to_restore(projection: &Value) -> Option<&str> {
+    let current = projection["thread"]["title"].as_str().unwrap_or("");
+    let imported = projection["providerThreads"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|p| p["nativeMetadata"]["title"].as_str().filter(|t| !t.trim().is_empty()))?;
+    let runs = projection["runs"].as_array()?;
+    let completed = runs.iter().any(|r| r["status"] == "completed");
+    (current != imported && !runs.is_empty() && !completed).then_some(imported)
 }
 
 #[cfg(test)]
@@ -626,6 +639,24 @@ mod tests {
         std::fs::write(dir.join("abc.jsonl"), "").unwrap();
         assert_eq!(claude_transcript(&home, &long, "abc"), dir.join("abc.jsonl"));
         std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn titles_are_restored_to_the_imported_title_only_before_any_turn_completes() {
+        let projection = |title: &str, runs: &[&str]| {
+            json!({
+                "thread": { "title": title },
+                "providerThreads": [{ "nativeMetadata": { "title": "From Paseo" } }],
+                "runs": runs.iter().map(|s| json!({ "status": s })).collect::<Vec<_>>(),
+            })
+        };
+        assert_eq!(title_to_restore(&projection("Resume previous session", &["failed"])), Some("From Paseo"));
+        assert_eq!(title_to_restore(&projection("From Paseo", &["failed"])), None);
+        assert_eq!(title_to_restore(&projection("Renamed by hand", &[])), None);
+        assert_eq!(title_to_restore(&projection("Retitled later", &["failed", "completed"])), None);
+        let mut no_metadata = projection("Resume previous session", &["failed"]);
+        no_metadata["providerThreads"] = json!([{ "nativeMetadata": null }]);
+        assert_eq!(title_to_restore(&no_metadata), None);
     }
 
     #[test]
